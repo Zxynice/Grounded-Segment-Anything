@@ -72,11 +72,8 @@ def _image_size(image_path: str) -> Tuple[int, int]:
 
 def _polygon_to_bbox(points: List[List[float]]) -> List[float]:
     """Convert a polygon (list of [x, y]) to an axis-aligned bbox [x, y, w, h]."""
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    x_min, x_max = min(xs), max(xs)
-    y_min, y_max = min(ys), max(ys)
-    return [x_min, y_min, x_max - x_min, y_max - y_min]
+    xs, ys = zip(*points)
+    return [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
 
 
 def _bbox_area(bbox: List[float]) -> float:

@@ -16,6 +16,7 @@
 
 ```
 finetune/
+├── annotate.py             # ★ 标注工具：配置 LabelMe / 查看进度 / 验证
 ├── prepare_dataset.py      # 数据集准备：格式转换 & 划分
 ├── songpan_dataset.py      # PyTorch Dataset（COCO 格式输入）
 ├── train_grounding_dino.py # GroundingDINO 微调脚本
@@ -60,6 +61,108 @@ wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-
 wget -q https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth \
      -O weights/sam_vit_h_4b8939.pth
 ```
+
+---
+
+### 0. 标注数据集 / Annotate your images
+
+> **如果您还未对图片进行标注，请先阅读本节。**  
+> **If your images are not yet annotated, read this section first.**
+
+#### 用方框还是多边形？/ Bounding box or polygon?
+
+> **结论：使用方框标注（Rectangle / Bounding Box）** ✓  
+> **Conclusion: Use rectangle (bounding-box) annotation** ✓
+
+Grounded-SAM 由两个阶段组成：
+
+```
+输入图像 + 文本提示
+       │
+       ▼  阶段 1：GroundingDINO（检测器）
+          文本提示 ──→ 预测边框（bounding box）
+          训练时仅需边框坐标，不需要多边形轮廓
+       │
+       ▼  阶段 2：SAM（分割模型）
+          边框提示 ──→ 自动生成像素级分割掩码
+          SAM 在推理阶段自动完成分割，无需人工标注掩码
+```
+
+| 标注方式 | 是否需要 | 原因 |
+|---------|---------|------|
+| ✓ 矩形边框（方框）| **是** | GroundingDINO 训练的唯一监督信号 |
+| ✗ 自由多边形轮廓 | **否** | 在 `prepare_dataset.py` 中被转换为边框后丢弃，没有额外价值 |
+
+The same two-stage logic explains it in English:  
+- **GroundingDINO** is a *detector*: it trains on and predicts bounding boxes only.  
+- **SAM** auto-generates polygon-quality masks at inference time from those boxes.  
+Therefore, bounding-box annotation is sufficient for the entire pipeline.
+
+#### 使用 LabelMe 进行方框标注 / Setting up LabelMe for bounding-box annotation
+
+**Step 1** 安装 LabelMe / Install LabelMe:
+
+```bash
+pip install labelme
+```
+
+**Step 2** 生成配置并查看详细说明 / Generate config and see full instructions:
+
+```bash
+python finetune/annotate.py setup \
+    --image_dir  data/songpan/images \
+    --output_dir data/songpan/annotations
+```
+
+该命令会输出可以直接复制运行的 LabelMe 命令，以及每个类别的标注建议。  
+This command prints the exact LabelMe command to run, plus per-category annotation tips.
+
+**Step 3** 启动 LabelMe / Start LabelMe:
+
+```bash
+labelme data/songpan/images \
+    --output    data/songpan/annotations \
+    --labels    data/songpan/annotations/labels.txt \
+    --nodata \
+    --autosave
+```
+
+在 LabelMe 中请使用 **"Create Rectangle"（快捷键 R）**，不要使用 "Create Polygon"。  
+In LabelMe, use **"Create Rectangle" (shortcut: R)** only. Do NOT use "Create Polygon".
+
+**Step 4** 查看标注进度 / Check annotation progress:
+
+```bash
+python finetune/annotate.py stats \
+    --image_dir  data/songpan/images \
+    --ann_dir    data/songpan/annotations
+```
+
+**Step 5** 验证（可自动修复误用的 polygon）/ Validate (auto-fix accidental polygons):
+
+```bash
+# 只检查 / Check only
+python finetune/annotate.py check \
+    --ann_dir data/songpan/annotations
+
+# 检查并自动将 polygon 转换为边框 / Check and fix
+python finetune/annotate.py check \
+    --ann_dir data/songpan/annotations \
+    --fix
+```
+
+#### 各类别标注建议 / Per-category annotation tips
+
+| 类别 | 标注建议 |
+|------|---------|
+| temple 寺庙 | 紧贴屋脊和山门画框 |
+| ancient city wall 古城墙 | 框住可见墙体段，含垛口 |
+| city gate 城门 | 包含完整城楼和拱洞 |
+| sculpture 雕塑 | 含基座/底座一并框入 |
+| pagoda 佛塔 | 从塔基到塔尖完整框出 |
+| ancient street 古街 | 框住铺装路面（长街可用多个框） |
+| monastery 寺院 | 包含正殿和院墙 |
+| stone arch bridge 石拱桥 | 含两侧桥拱和完整桥面 |
 
 ---
 
@@ -244,6 +347,15 @@ python finetune/inference_songpan.py \
 ---
 
 ## 常见问题 / FAQ
+
+**Q: 应该用方框标注还是 polygon 标注？/ Should I annotate with bounding boxes or polygons?**  
+A: 用**方框（Rectangle）标注**。GroundingDINO 只用边框做训练监督；SAM 会在推理时自动生成
+精细的分割掩码。即使你用 polygon 标注，`prepare_dataset.py` 也会把它转换为边框后才用，
+多边形坐标本身不会进入训练。  
+A: Use **rectangle (bounding-box)** annotation. GroundingDINO trains on boxes only; SAM
+auto-generates fine masks at inference time from those boxes. Any polygon annotations are
+automatically converted to their enclosing bbox by `prepare_dataset.py` and the polygon
+coordinates are discarded.
 
 **Q: 显存不足 (CUDA OOM)**  
 A: 减小 `--batch_size 1`，或使用 `--freeze_backbone` 降低显存占用。
