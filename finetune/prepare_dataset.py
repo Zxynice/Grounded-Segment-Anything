@@ -1,16 +1,28 @@
 """
 Dataset preparation utilities for Songpan Ancient City heritage element fine-tuning.
 
-Supports converting from common annotation formats to COCO JSON, which is required
-by the GroundingDINO fine-tuning pipeline.
+The training script (train_grounding_dino.py) requires annotations in COCO JSON format.
+This script converts from other common annotation formats, or validates/splits an
+existing COCO JSON file.
 
 Supported input formats:
-  - LabelMe JSON  (polygons / rectangles)
-  - VOC XML       (Pascal VOC bounding-box annotations)
-  - COCO JSON     (pass-through / validation)
+  - COCO JSON  (pass-through: validate + optional train/val split)
+  - LabelMe JSON  (per-image JSON files from the LabelMe annotation tool)
+  - VOC XML       (Pascal VOC bounding-box annotations from LabelImg etc.)
+
+Any annotation tool that exports COCO JSON directly (CVAT, Roboflow, makesense.ai,
+COCO Annotator, VGG VIA …) can use --input_format coco for validation and splitting.
 
 Usage:
-    # LabelMe -> COCO
+    # COCO JSON already produced by your annotation tool → validate + split
+    python finetune/prepare_dataset.py \
+        --input_format coco \
+        --input_dir  data/songpan/coco_annotations.json \
+        --image_dir  data/songpan/images \
+        --output     data/songpan/coco_annotations.json \
+        --split      0.8
+
+    # LabelMe → COCO
     python finetune/prepare_dataset.py \
         --input_format labelme \
         --input_dir  data/songpan/labelme_annotations \
@@ -18,19 +30,13 @@ Usage:
         --output     data/songpan/coco_annotations.json \
         --split      0.8
 
-    # VOC -> COCO
+    # VOC → COCO
     python finetune/prepare_dataset.py \
         --input_format voc \
         --input_dir  data/songpan/voc_annotations \
         --image_dir  data/songpan/images \
         --output     data/songpan/coco_annotations.json \
         --split      0.8
-
-    # Validate an existing COCO file
-    python finetune/prepare_dataset.py \
-        --input_format coco \
-        --input_dir  data/songpan/coco_annotations.json \
-        --image_dir  data/songpan/images
 """
 
 import argparse

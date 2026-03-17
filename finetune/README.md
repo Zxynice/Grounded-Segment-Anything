@@ -41,6 +41,57 @@ finetune/
 
 ---
 
+## ⚡ 必读：训练所需标注格式 / Required Annotation Format
+
+> **结论：是的，训练脚本要求标注文件为 COCO JSON 格式。**  
+> **Answer: YES — the training script requires annotations in COCO JSON format.**
+
+训练脚本 `train_grounding_dino.py` 通过 `--train_json` / `--val_json` 参数接受标注文件，
+这两个文件必须是 **COCO JSON 格式**。数据集类 `SongpanHeritageDataset` 直接解析该格式中的
+三个顶层字段：
+
+```
+{ "images":      [ {"id", "file_name", "width", "height"} ],
+  "annotations": [ {"id", "image_id", "category_id",
+                    "bbox": [x, y, width, height], "area", "iscrowd"} ],
+  "categories":  [ {"id", "name", "supercategory"} ] }
+```
+
+> 注意：`bbox` 格式是 **`[x, y,宽, 高]`**（COCO 标准），其中 `x, y` 是左上角像素坐标，
+> 不是两个角点坐标。  
+> Note: `bbox` uses **`[x, y, width, height]`** (COCO convention) with `x, y` at the top-left corner.
+
+### 使用任意标注工具 / Any annotation tool works
+
+**您不必使用 LabelMe。** 任何能导出 COCO JSON 或能转换为 COCO JSON 的标注工具均可使用：
+
+| 标注工具 | 是否直接输出 COCO JSON | 说明 |
+|---------|----------------------|------|
+| **CVAT** (cvat.org) | ✓ 原生支持 | 导出时选择 "COCO 1.0" 格式 |
+| **Roboflow** (roboflow.com) | ✓ 原生支持 | Export → COCO JSON |
+| **makesense.ai** | ✓ 原生支持 | Export Annotations → COCO JSON |
+| **COCO Annotator** | ✓ 原生支持 | 本身即 COCO 格式 |
+| **LabelImg** | ✗ 输出 VOC XML | 用 `prepare_dataset.py --input_format voc` 转换 |
+| **LabelMe** | ✗ 每图一个 JSON | 用 `annotate.py export` 或 `prepare_dataset.py --input_format labelme` 转换 |
+| **VGG VIA** | △ 部分版本支持 | 导出 COCO JSON 后直接使用 |
+| 其他任意工具 | 只需最终转换为 COCO JSON | 见下方格式说明 |
+
+如果您使用的工具**直接导出 COCO JSON**，只需用 `prepare_dataset.py` 做格式验证和划分：
+
+```bash
+# 验证已有 COCO JSON，可选 train/val 划分
+python finetune/prepare_dataset.py \
+    --input_format coco \
+    --input_dir    data/songpan/my_annotations.json \
+    --image_dir    data/songpan/images \
+    --output       data/songpan/coco_annotations.json \
+    --split        0.8
+```
+
+如果您使用的工具**不直接支持 COCO JSON**，见 [Step 3](#3-准备数据集其他格式--prepare-dataset-other-formats) 中的转换命令。
+
+---
+
 ## 快速开始 / Quick Start
 
 ### 0. 环境准备 / Prerequisites
@@ -68,6 +119,9 @@ wget -q https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth \
 
 > **如果您还未对图片进行标注，请先阅读本节。**  
 > **If your images are not yet annotated, read this section first.**
+>
+> 您可以使用任何标注工具，最终需要一个 COCO JSON 文件。  
+> You can use any annotation tool — you only need a COCO JSON file in the end.
 
 #### 用方框还是多边形？/ Bounding box or polygon?
 
@@ -91,14 +145,27 @@ Grounded-SAM 由两个阶段组成：
 | 标注方式 | 是否需要 | 原因 |
 |---------|---------|------|
 | ✓ 矩形边框（方框）| **是** | GroundingDINO 训练的唯一监督信号 |
-| ✗ 自由多边形轮廓 | **否** | 在 `prepare_dataset.py` 中被转换为边框后丢弃，没有额外价值 |
+| ✗ 自由多边形轮廓 | **否** | 在转换为 COCO JSON 时被转换为边框后丢弃，没有额外价值 |
 
 The same two-stage logic explains it in English:  
 - **GroundingDINO** is a *detector*: it trains on and predicts bounding boxes only.  
 - **SAM** auto-generates polygon-quality masks at inference time from those boxes.  
 Therefore, bounding-box annotation is sufficient for the entire pipeline.
 
-#### 使用 LabelMe 进行方框标注 / Setting up LabelMe for bounding-box annotation
+#### 选项 A：使用可直接导出 COCO JSON 的工具（推荐）/ Option A: Tools with native COCO JSON export (recommended)
+
+以下工具可以直接导出 COCO JSON，无需额外转换：
+
+- **[CVAT](https://cvat.org)** — 在线/本地都可，导出时选 `COCO 1.0` 格式
+- **[Roboflow](https://roboflow.com)** — 云端标注，Export → COCO JSON
+- **[makesense.ai](https://www.makesense.ai)** — 免费在线工具，Export → COCO JSON format
+- **[COCO Annotator](https://github.com/jsbroks/coco-annotator)** — 本地部署，原生 COCO 格式
+
+导出后用 `prepare_dataset.py` 验证并划分 train/val（见 [Step 3](#3-准备数据集其他格式--prepare-dataset-other-formats)）。
+
+#### 选项 B：使用 LabelMe（需转换）/ Option B: LabelMe (requires conversion)
+
+若您选择 LabelMe，流程如下：
 
 **Step 1** 安装 LabelMe / Install LabelMe:
 
@@ -113,9 +180,6 @@ python finetune/annotate.py setup \
     --image_dir  data/songpan/images \
     --output_dir data/songpan/annotations
 ```
-
-该命令会输出可以直接复制运行的 LabelMe 命令，以及每个类别的标注建议。  
-This command prints the exact LabelMe command to run, plus per-category annotation tips.
 
 **Step 3** 启动 LabelMe / Start LabelMe:
 
@@ -231,7 +295,23 @@ COCO JSON 结构（供参考）/ COCO JSON structure (for reference):
 
 ### 3. 准备数据集（其他格式）/ Prepare dataset (other formats)
 
-将您已有的松潘古城数据集从其他格式转换为 COCO JSON。
+如果您使用的标注工具**已直接导出 COCO JSON**，只需用 `prepare_dataset.py` 验证和划分；
+如果使用的是 LabelMe 或 VOC 格式，则需先转换。
+
+#### 工具已直接输出 COCO JSON（CVAT / Roboflow / makesense.ai 等）
+
+```bash
+python finetune/prepare_dataset.py \
+    --input_format coco \
+    --input_dir    data/songpan/my_annotations.json \
+    --image_dir    data/songpan/images \
+    --output       data/songpan/coco_annotations.json \
+    --split        0.8
+```
+
+输出：
+- `data/songpan/coco_annotations_train.json`
+- `data/songpan/coco_annotations_val.json`
 
 #### 从 LabelMe 格式转换（等同于 `annotate.py export`）
 
@@ -248,7 +328,7 @@ python finetune/prepare_dataset.py \
 - `data/songpan/coco_annotations_train.json`
 - `data/songpan/coco_annotations_val.json`
 
-#### 从 Pascal VOC (XML) 格式转换
+#### 从 Pascal VOC (XML) 格式转换（LabelImg 等工具）
 
 ```bash
 python finetune/prepare_dataset.py \
@@ -257,15 +337,6 @@ python finetune/prepare_dataset.py \
     --image_dir    data/songpan/images \
     --output       data/songpan/coco_annotations.json \
     --split        0.8
-```
-
-#### 验证现有 COCO JSON
-
-```bash
-python finetune/prepare_dataset.py \
-    --input_format coco \
-    --input_dir    data/songpan/my_coco.json \
-    --image_dir    data/songpan/images
 ```
 
 ---
@@ -384,6 +455,18 @@ python finetune/inference_songpan.py \
 ---
 
 ## 常见问题 / FAQ
+
+**Q: 训练脚本需要的标注格式是 COCO JSON 吗？/ Does training require COCO JSON format?**  
+A: **是的。** `train_grounding_dino.py` 的 `--train_json` / `--val_json` 参数只接受
+**COCO JSON 格式**的标注文件。您使用什么标注工具不重要，重要的是最终得到一个合法的
+COCO JSON 文件（含 `images`、`annotations`、`categories` 三个顶层字段，
+`bbox` 格式为 `[x, y, width, height]`）。
+各种工具的转换方式见 [必读：训练所需标注格式](#-必读训练所需标注格式--required-annotation-format) 一节。  
+A: **Yes.** The `--train_json` / `--val_json` arguments of `train_grounding_dino.py`
+accept only **COCO JSON format** annotation files. The annotation tool does not matter —
+what matters is producing a valid COCO JSON file with `images`, `annotations`, and
+`categories` top-level keys and bboxes in `[x, y, width, height]` format.
+See [Required Annotation Format](#-必读训练所需标注格式--required-annotation-format) for tool options.
 
 **Q: LabelMe 保存的 JSON 就是 COCO JSON 格式吗？/ Is the LabelMe JSON the same as COCO JSON?**  
 A: **不是**。LabelMe 为每张图片生成一个独立的 `.json` 文件（LabelMe 自有格式），
