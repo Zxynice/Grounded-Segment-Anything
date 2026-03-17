@@ -16,8 +16,8 @@
 
 ```
 finetune/
-├── annotate.py             # ★ 标注工具：配置 LabelMe / 查看进度 / 验证
-├── prepare_dataset.py      # 数据集准备：格式转换 & 划分
+├── annotate.py             # ★ 标注工具：配置 / 进度 / 验证 / 导出 COCO JSON
+├── prepare_dataset.py      # 数据集准备：VOC/COCO 格式转换 & 划分
 ├── songpan_dataset.py      # PyTorch Dataset（COCO 格式输入）
 ├── train_grounding_dino.py # GroundingDINO 微调脚本
 ├── inference_songpan.py    # 推理脚本（微调后模型 + SAM）
@@ -64,7 +64,7 @@ wget -q https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth \
 
 ---
 
-### 0. 标注数据集 / Annotate your images
+### 1. 标注数据集 / Annotate your images
 
 > **如果您还未对图片进行标注，请先阅读本节。**  
 > **If your images are not yet annotated, read this section first.**
@@ -138,18 +138,19 @@ python finetune/annotate.py stats \
     --ann_dir    data/songpan/annotations
 ```
 
-**Step 5** 验证（可自动修复误用的 polygon）/ Validate (auto-fix accidental polygons):
+**Step 5** 导出为 COCO JSON / Export to COCO JSON:
 
 ```bash
-# 只检查 / Check only
-python finetune/annotate.py check \
-    --ann_dir data/songpan/annotations
-
-# 检查并自动将 polygon 转换为边框 / Check and fix
-python finetune/annotate.py check \
-    --ann_dir data/songpan/annotations \
-    --fix
+python finetune/annotate.py export \
+    --ann_dir   data/songpan/annotations \
+    --image_dir data/songpan/images \
+    --output    data/songpan/coco_annotations.json \
+    --split     0.8
 ```
+
+这一步将 LabelMe 每张图片一个 JSON 的格式合并转换为训练脚本所需的单一 COCO JSON。  
+This converts the per-image LabelMe JSONs into the single COCO JSON required for training.
+详见 [Step 2](#2-导出-coco-json--export-to-coco-json)。
 
 #### 各类别标注建议 / Per-category annotation tips
 
@@ -166,19 +167,81 @@ python finetune/annotate.py check \
 
 ---
 
-### 1. 准备数据集 / Prepare the dataset
+### 2. 导出 COCO JSON / Export to COCO JSON
 
-将您已有的松潘古城数据集转换为 COCO JSON 格式。
+> **LabelMe 保存的是每张图片一个独立 JSON 文件（LabelMe 格式），不是 COCO JSON。**  
+> **LabelMe saves one JSON file per image (LabelMe format), NOT COCO JSON.**
 
-#### 从 LabelMe 格式转换
+#### 两种格式的区别 / Format differences
+
+| 特性 | LabelMe JSON | COCO JSON |
+|------|-------------|-----------|
+| 文件数量 | 每张图片一个 `.json` | 所有图片合并为**一个** `.json` |
+| 标注结构 | `shapes[].points` 二维坐标点列表 | `annotations[].bbox` `[x, y, w, h]` |
+| 边框表示 | 两个角点 `[[x1,y1],[x2,y2]]` | `[左上角x, 左上角y, 宽, 高]` |
+| 类别信息 | 仅文字 label 字符串 | 独立 `categories` 数组 + `category_id` |
+| 训练支持 | ✗ 训练脚本不直接读取 | ✓ 训练脚本直接读取 |
+
+运行以下命令将 LabelMe JSON 转换为训练所需的 COCO JSON：  
+Run the following to convert LabelMe JSONs to the COCO JSON required for training:
+
+```bash
+python finetune/annotate.py export \
+    --ann_dir   data/songpan/annotations \
+    --image_dir data/songpan/images \
+    --output    data/songpan/coco_annotations.json \
+    --split     0.8          # 80% 训练 / 20% 验证
+```
+
+输出 / Output:
+- `data/songpan/coco_annotations_train.json`
+- `data/songpan/coco_annotations_val.json`
+
+COCO JSON 结构（供参考）/ COCO JSON structure (for reference):
+
+```json
+{
+  "images": [
+    {"id": 1, "file_name": "IMG_001.jpg", "width": 1920, "height": 1080}
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [100, 200, 300, 150],
+      "area": 45000,
+      "segmentation": [],
+      "iscrowd": 0
+    }
+  ],
+  "categories": [
+    {"id": 1, "name": "temple", "supercategory": "heritage"},
+    {"id": 2, "name": "ancient city wall", "supercategory": "heritage"}
+  ]
+}
+```
+
+> **注：** `bbox` 格式为 `[x, y, width, height]`（COCO 标准），
+> 其中 `x, y` 是左上角像素坐标。  
+> **Note:** `bbox` follows the COCO convention `[x, y, width, height]`
+> where `x, y` is the top-left corner in pixel coordinates.
+
+---
+
+### 3. 准备数据集（其他格式）/ Prepare dataset (other formats)
+
+将您已有的松潘古城数据集从其他格式转换为 COCO JSON。
+
+#### 从 LabelMe 格式转换（等同于 `annotate.py export`）
 
 ```bash
 python finetune/prepare_dataset.py \
     --input_format labelme \
-    --input_dir    data/songpan/labelme_annotations \
+    --input_dir    data/songpan/annotations \
     --image_dir    data/songpan/images \
     --output       data/songpan/coco_annotations.json \
-    --split        0.8        # 80% 训练 / 20% 验证
+    --split        0.8
 ```
 
 输出：
@@ -205,35 +268,9 @@ python finetune/prepare_dataset.py \
     --image_dir    data/songpan/images
 ```
 
-**COCO JSON 格式说明 / COCO JSON format:**
-
-```json
-{
-  "images": [
-    {"id": 1, "file_name": "IMG_001.jpg", "width": 1920, "height": 1080}
-  ],
-  "annotations": [
-    {
-      "id": 1,
-      "image_id": 1,
-      "category_id": 1,
-      "bbox": [100, 200, 300, 150],   // [x, y, width, height] 像素坐标
-      "area": 45000,
-      "segmentation": [],
-      "iscrowd": 0
-    }
-  ],
-  "categories": [
-    {"id": 1, "name": "temple", "supercategory": "heritage"},
-    {"id": 2, "name": "ancient city wall", "supercategory": "heritage"},
-    ...
-  ]
-}
-```
-
 ---
 
-### 2. 微调 GroundingDINO / Fine-tune GroundingDINO
+### 4. 微调 GroundingDINO / Fine-tune GroundingDINO
 
 ```bash
 python finetune/train_grounding_dino.py \
@@ -275,7 +312,7 @@ python finetune/train_grounding_dino.py \
 
 ---
 
-### 3. 推理 / Inference
+### 5. 推理 / Inference
 
 使用微调后的 GroundingDINO + 原始 SAM 对新图像进行分割：
 
@@ -348,13 +385,22 @@ python finetune/inference_songpan.py \
 
 ## 常见问题 / FAQ
 
+**Q: LabelMe 保存的 JSON 就是 COCO JSON 格式吗？/ Is the LabelMe JSON the same as COCO JSON?**  
+A: **不是**。LabelMe 为每张图片生成一个独立的 `.json` 文件（LabelMe 自有格式），
+需要运行 `annotate.py export` 将多张图片的标注合并并转换为训练脚本所需的
+单一 COCO JSON 文件。两者的主要区别见上方 [Step 2 格式对比表](#2-导出-coco-json--export-to-coco-json)。  
+A: **No.** LabelMe writes one `.json` file per image in LabelMe's own format.
+Run `annotate.py export` to merge all per-image files and convert them into a
+single COCO JSON file that the training script can read.
+See the [Step 2 format table](#2-导出-coco-json--export-to-coco-json) for differences.
+
 **Q: 应该用方框标注还是 polygon 标注？/ Should I annotate with bounding boxes or polygons?**  
 A: 用**方框（Rectangle）标注**。GroundingDINO 只用边框做训练监督；SAM 会在推理时自动生成
-精细的分割掩码。即使你用 polygon 标注，`prepare_dataset.py` 也会把它转换为边框后才用，
+精细的分割掩码。即使你用 polygon 标注，`annotate.py export` 也会把它转换为边框后才用，
 多边形坐标本身不会进入训练。  
 A: Use **rectangle (bounding-box)** annotation. GroundingDINO trains on boxes only; SAM
 auto-generates fine masks at inference time from those boxes. Any polygon annotations are
-automatically converted to their enclosing bbox by `prepare_dataset.py` and the polygon
+automatically converted to their enclosing bbox by `annotate.py export` and the polygon
 coordinates are discarded.
 
 **Q: 显存不足 (CUDA OOM)**  

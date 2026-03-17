@@ -1,8 +1,8 @@
 """
 Annotation toolkit for the Songpan Ancient City heritage dataset.
 
-Three modes
------------
+Modes
+-----
 setup   Generate a LabelMe labels file and print step-by-step annotation
         instructions.  ONLY rectangle (bounding-box) shapes are listed so
         that annotators use the correct tool.
@@ -16,6 +16,38 @@ check   Validate completed LabelMe JSON files.  Reports:
           - annotations whose label is not in SONGPAN_CATEGORIES
         Optionally converts accidental polygon annotations to their
         axis-aligned bounding boxes (--fix flag).
+
+export  Convert completed LabelMe per-image JSON files into a single COCO
+        JSON file (the format required by the training pipeline).
+        Optionally splits into train and val subsets.
+
+        LabelMe saves ONE JSON file per image (LabelMe format).
+        The training script requires ONE combined COCO JSON for all images.
+        This command performs that conversion.
+
+Format differences
+------------------
+  LabelMe (per-image JSON, one file per image)
+  ┌──────────────────────────────────────────────┐
+  │ { "imagePath": "IMG_001.jpg",                │
+  │   "imageWidth": 1920, "imageHeight": 1080,   │
+  │   "shapes": [                                │
+  │     { "label": "temple",                     │
+  │       "shape_type": "rectangle",             │
+  │       "points": [[100,200],[400,350]] }       │
+  │   ] }                                        │
+  └──────────────────────────────────────────────┘
+
+  COCO JSON (single file for all images)
+  ┌──────────────────────────────────────────────┐
+  │ { "images":      [ {id, file_name, w, h} ],  │
+  │   "annotations": [ {id, image_id,           │
+  │                      category_id,            │
+  │                      bbox:[x,y,w,h],         │
+  │                      area, segmentation,     │
+  │                      iscrowd} ],             │
+  │   "categories":  [ {id, name, ...} ] }       │
+  └──────────────────────────────────────────────┘
 
 Why bounding boxes, not polygons?
 ----------------------------------
@@ -31,8 +63,8 @@ high-quality, polygon-equivalent masks automatically.
 Therefore:
   ✓  Bounding-box (方框) annotation  ← CORRECT choice
   ✗  Free-polygon (自由锚点) annotation  ← unnecessary overhead
-     (polygons in LabelMe JSONs are silently converted to their
-      enclosing bounding boxes by prepare_dataset.py anyway)
+     (polygon points are converted to their enclosing bbox on export
+      and the polygon coordinates are discarded)
 
 Usage examples
 --------------
@@ -50,12 +82,19 @@ Usage examples
   python finetune/annotate.py check \
       --ann_dir  data/songpan/annotations \
       --fix
+
+  # Convert LabelMe JSON files → COCO JSON (80/20 train/val split)
+  python finetune/annotate.py export \
+      --ann_dir   data/songpan/annotations \
+      --image_dir data/songpan/images \
+      --output    data/songpan/coco_annotations.json \
+      --split     0.8
 """
 
 import argparse
-import glob
 import json
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -155,14 +194,13 @@ def cmd_setup(image_dir: str, output_dir: str) -> None:
   GroundingDINO 的训练只需要边框坐标，不需要 polygon 轮廓。
   SAM 会在推理阶段根据边框自动生成高质量的 polygon 级别掩码。
   因此，仅标注矩形边框即可满足整个流水线的需求，
-  多余的 polygon 标注会被 prepare_dataset.py 自动转换为边框后丢弃。
+  多余的 polygon 标注会被 annotate.py export 自动转换为边框后丢弃。
 
   Reason:
   GroundingDINO is a detector: it predicts and trains on bounding boxes.
   SAM then auto-generates pixel-level masks from those boxes at runtime.
-  Polygon annotations are discarded (converted to their enclosing bbox)
-  by prepare_dataset.py, so they provide no benefit while costing more
-  annotation time.
+  Polygon annotations are converted to their enclosing bbox by
+  'annotate.py export' and the polygon coordinates are discarded.
 """)
 
     print("─" * 70)
@@ -190,13 +228,12 @@ def cmd_setup(image_dir: str, output_dir: str) -> None:
                 --ann_dir {out.resolve()}
           to verify there are no issues.
 
-  Step 6  Convert to COCO format and split train/val:
-            python finetune/prepare_dataset.py \\
-                --input_format labelme \\
-                --input_dir    {out.resolve()} \\
-                --image_dir    {Path(image_dir).resolve()} \\
-                --output       data/songpan/coco_annotations.json \\
-                --split        0.8
+  Step 6  Convert LabelMe JSONs → COCO JSON (LabelMe format ≠ COCO format):
+            python finetune/annotate.py export \\
+                --ann_dir   {out.resolve()} \\
+                --image_dir {Path(image_dir).resolve()} \\
+                --output    data/songpan/coco_annotations.json \\
+                --split     0.8
 """)
 
     print("─" * 70)
@@ -374,6 +411,206 @@ def cmd_check(ann_dir: str, fix: bool = False) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Helpers shared by check and export
+# ---------------------------------------------------------------------------
+
+def _bbox_area(bbox: List[float]) -> float:
+    return bbox[2] * bbox[3]
+
+
+def _labelme_to_coco(
+    ann_dir: str,
+    image_dir: str,
+    categories: Optional[List[Dict]] = None,
+) -> Dict:
+    """
+    Convert a directory of LabelMe per-image JSON files into a single
+    COCO-format dict.
+
+    LabelMe JSON (one file per image) vs COCO JSON (one file for all):
+    - LabelMe stores shapes with 'shape_type' + 'points' (rect or polygon)
+    - COCO stores a flat list of annotations with 'bbox' [x, y, w, h]
+    Rectangle points [[x1,y1],[x2,y2]] → bbox [min_x, min_y, w, h].
+    Polygon points   [[x,y],...] are converted to their enclosing bbox.
+    """
+    if categories is None:
+        categories = SONGPAN_CATEGORIES
+    name2id = {c["name"].lower(): c["id"] for c in categories}
+
+    images: List[Dict] = []
+    annotations: List[Dict] = []
+    img_id = 1
+    ann_id = 1
+
+    for jf in _iter_annotations(ann_dir):
+        try:
+            with open(jf) as f:
+                lm = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"  [WARN] Skipping unreadable file {jf.name}: {exc}")
+            continue
+
+        # Resolve image filename
+        img_filename = lm.get("imagePath", "")
+        if not img_filename:
+            base = jf.stem
+            for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
+                if os.path.exists(os.path.join(image_dir, base + ext)):
+                    img_filename = base + ext
+                    break
+            if not img_filename:
+                img_filename = jf.stem + ".jpg"
+
+        # Image dimensions
+        img_path = os.path.join(image_dir, img_filename)
+        if os.path.exists(img_path):
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(img_path) as _img:
+                    w, h = _img.size
+            except Exception:
+                w = lm.get("imageWidth", 0)
+                h = lm.get("imageHeight", 0)
+        else:
+            w = lm.get("imageWidth", 0)
+            h = lm.get("imageHeight", 0)
+
+        images.append({"id": img_id, "file_name": img_filename,
+                        "width": w, "height": h})
+
+        for shape in lm.get("shapes", []):
+            label = shape.get("label", "").lower()
+            cat_id = name2id.get(label)
+            if cat_id is None:
+                print(f"  [WARN] Unknown label '{label}' in {jf.name} — skipped.")
+                continue
+
+            pts = shape.get("points", [])
+            stype = shape.get("shape_type", "polygon")
+
+            if stype == "rectangle" and len(pts) == 2:
+                (x1, y1), (x2, y2) = pts
+                bbox = [min(x1, x2), min(y1, y2),
+                        abs(x2 - x1), abs(y2 - y1)]
+            elif len(pts) >= 2:
+                # polygon or any other multi-point shape → enclosing bbox
+                xs, ys = zip(*pts)
+                bbox = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+            else:
+                continue  # degenerate shape — skip
+
+            area = _bbox_area(bbox)
+            if area <= 0:
+                continue
+
+            annotations.append({
+                "id": ann_id,
+                "image_id": img_id,
+                "category_id": cat_id,
+                "bbox": bbox,
+                "area": area,
+                "segmentation": [],
+                "iscrowd": 0,
+            })
+            ann_id += 1
+
+        img_id += 1
+
+    return {"images": images, "annotations": annotations,
+            "categories": categories}
+
+
+def _split_coco(
+    coco: Dict, train_ratio: float, seed: int = 42
+) -> Tuple[Dict, Dict]:
+    """Return (train_coco, val_coco) by image-level random split."""
+    imgs = coco["images"][:]
+    random.seed(seed)
+    random.shuffle(imgs)
+    cut = int(len(imgs) * train_ratio)
+    train_imgs, val_imgs = imgs[:cut], imgs[cut:]
+    train_ids = {i["id"] for i in train_imgs}
+    val_ids   = {i["id"] for i in val_imgs}
+    return (
+        {"images": train_imgs,
+         "annotations": [a for a in coco["annotations"] if a["image_id"] in train_ids],
+         "categories": coco["categories"]},
+        {"images": val_imgs,
+         "annotations": [a for a in coco["annotations"] if a["image_id"] in val_ids],
+         "categories": coco["categories"]},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode: export
+# ---------------------------------------------------------------------------
+
+def cmd_export(
+    ann_dir: str,
+    image_dir: str,
+    output: str,
+    split: float = 0.0,
+    seed: int = 42,
+) -> None:
+    """
+    Convert LabelMe per-image JSON files to a single COCO JSON file.
+
+    LabelMe format (NOT COCO):
+      - One .json file per image, stored in ann_dir
+      - Each file contains 'shapes' with 'shape_type' and 'points'
+      - bbox coordinates stored as two corner points [[x1,y1],[x2,y2]]
+
+    COCO JSON format (required by training pipeline):
+      - Single .json file for all images
+      - Top-level keys: 'images', 'annotations', 'categories'
+      - Each annotation has 'bbox': [x, y, width, height]
+
+    When split > 0, writes <output>_train.json and <output>_val.json.
+    """
+    print(f"[export] Reading LabelMe annotations from: {ann_dir}")
+    coco = _labelme_to_coco(ann_dir, image_dir)
+
+    n_imgs = len(coco["images"])
+    n_anns = len(coco["annotations"])
+    print(f"  Converted: {n_imgs} images, {n_anns} annotations, "
+          f"{len(coco['categories'])} categories.")
+
+    if n_imgs == 0:
+        print("  [WARN] No images found — check --ann_dir path.")
+        return
+
+    out = Path(output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if 0.0 < split < 1.0:
+        train_coco, val_coco = _split_coco(coco, train_ratio=split, seed=seed)
+        train_out = out.parent / (out.stem + "_train.json")
+        val_out   = out.parent / (out.stem + "_val.json")
+        with open(train_out, "w") as f:
+            json.dump(train_coco, f, ensure_ascii=False)
+        with open(val_out, "w") as f:
+            json.dump(val_coco, f, ensure_ascii=False)
+        print(f"  Train ({len(train_coco['images'])} images) → {train_out}")
+        print(f"  Val   ({len(val_coco['images'])} images)   → {val_out}")
+        print()
+        print("  Next step — fine-tune GroundingDINO:")
+        print(f"    python finetune/train_grounding_dino.py \\")
+        print(f"        --train_json {train_out} \\")
+        print(f"        --val_json   {val_out} \\")
+        print(f"        --image_dir  {Path(image_dir).resolve()}")
+    else:
+        with open(out, "w") as f:
+            json.dump(coco, f, ensure_ascii=False)
+        print(f"  Saved: {out}")
+        print()
+        print("  Next step — fine-tune GroundingDINO:")
+        print(f"    python finetune/train_grounding_dino.py \\")
+        print(f"        --train_json {out} \\")
+        print(f"        --image_dir  {Path(image_dir).resolve()}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -440,6 +677,49 @@ def main() -> None:
         ),
     )
 
+    # --- export ---
+    p_export = sub.add_parser(
+        "export",
+        help=(
+            "Convert LabelMe per-image JSONs → single COCO JSON. "
+            "LabelMe format ≠ COCO format; this step is required before training."
+        ),
+    )
+    p_export.add_argument(
+        "--ann_dir",
+        required=True,
+        help="Directory containing LabelMe JSON annotation files (one per image).",
+    )
+    p_export.add_argument(
+        "--image_dir",
+        required=True,
+        help="Directory containing the image files (used to read image dimensions).",
+    )
+    p_export.add_argument(
+        "--output",
+        default="data/songpan/coco_annotations.json",
+        help=(
+            "Output COCO JSON file path. "
+            "When --split is provided, writes <output>_train.json and <output>_val.json "
+            "(default: data/songpan/coco_annotations.json)."
+        ),
+    )
+    p_export.add_argument(
+        "--split",
+        type=float,
+        default=0.0,
+        help=(
+            "Train/val split ratio, e.g. 0.8 → 80%% train / 20%% val. "
+            "When provided, writes two files instead of one (default: 0, no split)."
+        ),
+    )
+    p_export.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible train/val split (default: 42).",
+    )
+
     args = parser.parse_args()
 
     if args.mode == "setup":
@@ -449,6 +729,9 @@ def main() -> None:
     elif args.mode == "check":
         issues = cmd_check(args.ann_dir, fix=args.fix)
         sys.exit(0 if issues == 0 else 1)
+    elif args.mode == "export":
+        cmd_export(args.ann_dir, args.image_dir, args.output,
+                   split=args.split, seed=args.seed)
 
 
 if __name__ == "__main__":
