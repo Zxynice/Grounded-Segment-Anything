@@ -22,10 +22,25 @@ Training strategy:
          - L1 loss     for bounding-box regression
          - GIoU loss   for bounding-box quality
     4. Hungarian matching assigns each prediction to the nearest GT box/category.
-    5. Checkpoints are saved after every epoch; the best validation loss is tracked.
+    5. Periodic checkpoints are saved every ``--save_interval`` epochs (default 10).
+       A checkpoint is always written at the final epoch.
+    6. The model with the best validation F1-score (or best training loss when no
+       validation split is provided) is saved as ``best_model.pth``.
+    7. After training, performance metrics (Accuracy, Precision, Recall, F1-score,
+       Class Pixel Accuracy) and loss curves are plotted via matplotlib and saved to
+       ``--output_dir`` as ``training_curves.png`` and ``detection_metrics.png``.
+
+Outputs (under --output_dir):
+    checkpoint_epoch010.pth   – periodic checkpoint (every --save_interval epochs)
+    best_model.pth            – best model by val F1 (or train loss if no val set)
+    final_model.pth           – last-epoch weights
+    training_curves.png       – train / val loss curves
+    detection_metrics.png     – Accuracy / Precision / Recall / F1 / Class Pixel Acc
+    metrics_history.json      – raw per-epoch numbers
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -33,6 +48,9 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend; must be set before pyplot import
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,6 +96,34 @@ def sigmoid_focal_loss(
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
     return loss.mean(1).sum() / num_boxes
+
+
+# ---------------------------------------------------------------------------
+# Box IoU helper (used for detection metrics)
+# ---------------------------------------------------------------------------
+
+def _box_iou_diag(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """
+    Compute per-pair IoU between two equal-length sets of boxes in xyxy format.
+
+    Args:
+        boxes1 : (k, 4)  xyxy, values in [0, 1]
+        boxes2 : (k, 4)  xyxy, values in [0, 1]
+
+    Returns:
+        iou : (k,)  true IoU in [0, 1]  (not GIoU)
+    """
+    x1 = torch.max(boxes1[:, 0], boxes2[:, 0])
+    y1 = torch.max(boxes1[:, 1], boxes2[:, 1])
+    x2 = torch.min(boxes1[:, 2], boxes2[:, 2])
+    y2 = torch.min(boxes1[:, 3], boxes2[:, 3])
+    inter = (x2 - x1).clamp(min=0.0) * (y2 - y1).clamp(min=0.0)
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0.0) * \
+            (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0.0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0.0) * \
+            (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0.0)
+    union = area1 + area2 - inter
+    return inter / union.clamp(min=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -365,10 +411,39 @@ def evaluate(
     weight_loss_cls: float,
     weight_loss_bbox: float,
     weight_loss_giou: float,
-) -> Dict[str, float]:
+    iou_threshold: float = 0.5,
+    num_categories: int = 8,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Evaluate the model on *dataloader*.
+
+    Returns:
+        loss_dict : averaged losses over all batches
+        metrics   : detection metrics dict with keys:
+                    accuracy, precision, recall, f1, class_pixel_acc
+
+    Detection metric definitions (at IoU threshold ``iou_threshold``):
+        After Hungarian matching of nq predictions to ng GT boxes per image:
+          TP = matched pairs whose box IoU >= iou_threshold
+          FP = nq - TP   (unmatched predictions + low-IoU matches)
+          FN = ng - TP   (unmatched GT boxes   + low-IoU matches)
+        Accuracy        = TP / (TP + FP + FN)  [Jaccard / instance-level mIoU]
+        Precision       = TP / (TP + FP)
+        Recall          = TP / (TP + FN)
+        F1              = 2 * P * R / (P + R)
+        Class Pixel Acc = mean per-category recall (detection rate averaged over classes)
+    """
     model.eval()
-    running = {"loss_cls": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0, "total": 0.0}
+    running_loss = {"loss_cls": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0, "total": 0.0}
     n_batches = len(dataloader)
+
+    # Metric accumulators
+    total_tp: int = 0
+    total_fp: int = 0
+    total_fn: int = 0
+    # per_class arrays indexed by category_id (1-based; index 0 unused)
+    per_class_tp = [0.0] * (num_categories + 1)
+    per_class_gt = [0.0] * (num_categories + 1)
 
     for images, targets in dataloader:
         image_tensors = [img.to(device) for img in images]
@@ -376,14 +451,188 @@ def evaluate(
         captions = [t["caption"] for t in targets]
 
         outputs = model(samples, captions=captions)
+
         _, loss_dict = compute_loss(
             outputs, targets, matcher, device,
             weight_loss_cls, weight_loss_bbox, weight_loss_giou,
         )
         for k, v in loss_dict.items():
-            running[k] += v
+            running_loss[k] += v
 
-    return {k: v / max(n_batches, 1) for k, v in running.items()}
+        # ---------- per-image detection metrics ----------
+        pred_logits_batch = outputs["pred_logits"]   # (B, nq, max_text_len)
+        pred_boxes_batch = outputs["pred_boxes"]     # (B, nq, 4) cxcywh
+
+        for b_idx, target in enumerate(targets):
+            pred_logits = pred_logits_batch[b_idx]         # (nq, max_text_len)
+            pred_boxes  = pred_boxes_batch[b_idx]          # (nq, 4)
+            tgt_boxes        = target["boxes"].to(device)  # (ng, 4) cxcywh
+            tgt_positive_map = target["positive_map"].to(device)
+            tgt_labels       = target["labels"]            # (ng,) CPU tensor
+            ng = tgt_boxes.shape[0]
+            nq = pred_boxes.shape[0]
+
+            if ng == 0:
+                continue
+
+            # Accumulate GT counts per category
+            for cat_id in tgt_labels.tolist():
+                if 0 <= cat_id <= num_categories:
+                    per_class_gt[cat_id] += 1
+
+            max_text_len = tgt_positive_map.shape[1]
+            pred_logits_c = pred_logits[:, :max_text_len]
+
+            pred_idx, tgt_idx = matcher(
+                pred_logits_c, pred_boxes,
+                tgt_positive_map, tgt_boxes,
+            )
+
+            if pred_idx.numel() == 0:
+                # No matches: all GT are FN, all predictions are FP
+                total_fn += ng
+                total_fp += nq
+                continue
+
+            k = pred_idx.numel()
+            matched_pred_xyxy = box_cxcywh_to_xyxy(pred_boxes[pred_idx]).clamp(0.0, 1.0)
+            matched_tgt_xyxy  = box_cxcywh_to_xyxy(tgt_boxes[tgt_idx]).clamp(0.0, 1.0)
+            matched_tgt_labels = tgt_labels[tgt_idx.cpu()]  # CPU indexing
+
+            pair_ious = _box_iou_diag(matched_pred_xyxy, matched_tgt_xyxy)
+            tp_mask = pair_ious >= iou_threshold
+            tp = int(tp_mask.sum().item())
+
+            total_tp += tp
+            total_fp += nq - tp   # unmatched predictions + low-IoU matches
+            total_fn += ng - tp   # unmatched GT boxes   + low-IoU matches
+
+            for is_tp, cat_id in zip(tp_mask.tolist(), matched_tgt_labels.tolist()):
+                if is_tp and 0 <= cat_id <= num_categories:
+                    per_class_tp[cat_id] += 1
+
+    # ---- aggregate losses ----
+    losses = {k: v / max(n_batches, 1) for k, v in running_loss.items()}
+
+    # ---- aggregate detection metrics ----
+    denom_prec = total_tp + total_fp
+    denom_rec  = total_tp + total_fn
+    denom_acc  = total_tp + total_fp + total_fn
+
+    precision = total_tp / denom_prec if denom_prec > 0 else 0.0
+    recall    = total_tp / denom_rec  if denom_rec  > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) > 0 else 0.0)
+    accuracy  = total_tp / denom_acc if denom_acc > 0 else 0.0
+
+    valid_recalls = [
+        per_class_tp[i] / per_class_gt[i]
+        for i in range(len(per_class_gt))
+        if per_class_gt[i] > 0
+    ]
+    class_pixel_acc = (sum(valid_recalls) / len(valid_recalls)
+                       if valid_recalls else 0.0)
+
+    metrics = {
+        "accuracy":        accuracy,
+        "precision":       precision,
+        "recall":          recall,
+        "f1":              f1,
+        "class_pixel_acc": class_pixel_acc,
+    }
+    return losses, metrics
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_training_curves(
+    history: Dict[str, List],
+    output_dir: str,
+) -> None:
+    """
+    Save training visualisation plots to *output_dir*.
+
+    Generates two files:
+        training_curves.png   – total / cls / bbox / GIoU loss per epoch
+                                (train and val overlaid when both are available)
+        detection_metrics.png – Accuracy / Precision / Recall / F1 / Class Pixel Acc
+                                (validation only; skipped when no val set)
+    """
+    epochs = list(range(1, len(history.get("train_total", [])) + 1))
+    if not epochs:
+        return
+
+    # ---- Figure 1: Loss curves (2×2 grid) ----
+    loss_pairs = [
+        ("train_total",     "val_total",     "Total Loss"),
+        ("train_loss_cls",  "val_loss_cls",  "Classification Loss"),
+        ("train_loss_bbox", "val_loss_bbox", "BBox L1 Loss"),
+        ("train_loss_giou", "val_loss_giou", "GIoU Loss"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for ax, (train_key, val_key, title) in zip(axes.flat, loss_pairs):
+        if history.get(train_key):
+            ax.plot(epochs, history[train_key], label="train",
+                    color="tab:blue", linewidth=1.5)
+        if history.get(val_key):
+            ax.plot(epochs, history[val_key], label="val",
+                    color="tab:orange", linewidth=1.5)
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle("Training / Validation Loss Curves", fontsize=13)
+    fig.tight_layout()
+    loss_png = os.path.join(output_dir, "training_curves.png")
+    fig.savefig(loss_png, dpi=150)
+    plt.close(fig)
+    print(f"  → {loss_png}")
+
+    # ---- Figure 2: Detection metrics (validation only) ----
+    metric_defs = [
+        ("val_accuracy",        "Accuracy",         "tab:blue"),
+        ("val_precision",       "Precision",        "tab:orange"),
+        ("val_recall",          "Recall",           "tab:green"),
+        ("val_f1",              "F1-score",         "tab:red"),
+        ("val_class_pixel_acc", "Class Pixel Acc",  "tab:purple"),
+    ]
+    available = [
+        (hk, label, color)
+        for hk, label, color in metric_defs
+        if history.get(hk)  # non-empty list with at least one value
+    ]
+    if not available:
+        return  # no validation data → skip detection metrics plot
+
+    n = len(available)
+    cols = min(3, n)
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+    for i, (hk, label, color) in enumerate(available):
+        ax = axes[i // cols][i % cols]
+        vals = history[hk]
+        ax.plot(epochs, vals, color=color, linewidth=1.5, marker="o", markersize=3)
+        # Vertical dashed line at the best (highest) epoch
+        best_idx = int(max(range(len(vals)), key=lambda j: vals[j]))
+        ax.axvline(best_idx + 1, color="grey", linestyle="--",
+                   linewidth=0.8, alpha=0.7, label=f"best (ep {best_idx + 1})")
+        ax.set_title(label)
+        ax.set_xlabel("Epoch")
+        ax.set_ylim(-0.05, 1.05)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    # Hide unused subplot cells
+    for i in range(n, rows * cols):
+        axes[i // cols][i % cols].set_visible(False)
+    fig.suptitle(f"Validation Detection Metrics (IoU ≥ threshold)", fontsize=13)
+    fig.tight_layout()
+    metrics_png = os.path.join(output_dir, "detection_metrics.png")
+    fig.savefig(metrics_png, dpi=150)
+    plt.close(fig)
+    print(f"  → {metrics_png}")
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +694,20 @@ def main():
     parser.add_argument("--weight_loss_cls",  type=float, default=1.0)
     parser.add_argument("--weight_loss_bbox", type=float, default=5.0)
     parser.add_argument("--weight_loss_giou", type=float, default=2.0)
+    # Checkpoint / metrics
+    parser.add_argument(
+        "--save_interval",
+        type=int,
+        default=10,
+        help="Save a periodic checkpoint every N epochs (default: 10). "
+             "The best-model and final checkpoints are always saved.",
+    )
+    parser.add_argument(
+        "--iou_threshold",
+        type=float,
+        default=0.5,
+        help="IoU threshold for TP/FP/FN when computing detection metrics (default: 0.5).",
+    )
     # Output
     parser.add_argument("--output_dir", default="outputs/songpan_finetune")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -452,6 +715,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device)
+    num_categories = len(SONGPAN_CATEGORIES)
 
     # ---- load model ----
     model = load_model_for_finetuning(
@@ -520,9 +784,30 @@ def main():
         cost_giou=args.weight_loss_giou,
     )
 
-    # ---- training loop ----
-    best_val_loss = math.inf
+    # ---- per-epoch history (used for plotting and metrics_history.json) ----
+    history: Dict[str, List] = {
+        "train_total":         [],
+        "train_loss_cls":      [],
+        "train_loss_bbox":     [],
+        "train_loss_giou":     [],
+        "val_total":           [],
+        "val_loss_cls":        [],
+        "val_loss_bbox":       [],
+        "val_loss_giou":       [],
+        "val_accuracy":        [],
+        "val_precision":       [],
+        "val_recall":          [],
+        "val_f1":              [],
+        "val_class_pixel_acc": [],
+    }
 
+    # best_score is higher-is-better:
+    #   val F1  when a validation set is provided
+    #   negative train loss  otherwise
+    best_score = -math.inf
+    best_epoch = 0
+
+    # ---- training loop ----
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_losses = train_one_epoch(
@@ -538,40 +823,97 @@ def main():
             + "  ".join(f"train_{k}={v:.4f}" for k, v in train_losses.items())
         )
 
-        # Save checkpoint every epoch
-        ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch:03d}.pth")
-        torch.save(
-            {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "train_losses": train_losses,
-            },
-            ckpt_path,
-        )
+        # Update train history
+        history["train_total"].append(train_losses["total"])
+        history["train_loss_cls"].append(train_losses["loss_cls"])
+        history["train_loss_bbox"].append(train_losses["loss_bbox"])
+        history["train_loss_giou"].append(train_losses["loss_giou"])
 
+        # ---------- validation ----------
         if val_loader is not None:
-            val_losses = evaluate(
+            val_losses, val_metrics = evaluate(
                 model, val_loader, matcher, device,
                 args.weight_loss_cls, args.weight_loss_bbox, args.weight_loss_giou,
+                iou_threshold=args.iou_threshold,
+                num_categories=num_categories,
             )
-            val_total = val_losses["total"]
+            history["val_total"].append(val_losses["total"])
+            history["val_loss_cls"].append(val_losses["loss_cls"])
+            history["val_loss_bbox"].append(val_losses["loss_bbox"])
+            history["val_loss_giou"].append(val_losses["loss_giou"])
+            history["val_accuracy"].append(val_metrics["accuracy"])
+            history["val_precision"].append(val_metrics["precision"])
+            history["val_recall"].append(val_metrics["recall"])
+            history["val_f1"].append(val_metrics["f1"])
+            history["val_class_pixel_acc"].append(val_metrics["class_pixel_acc"])
+
             print(
-                "  val: "
-                + "  ".join(f"{k}={v:.4f}" for k, v in val_losses.items())
+                f"  val  loss={val_losses['total']:.4f}  "
+                f"acc={val_metrics['accuracy']:.4f}  "
+                f"prec={val_metrics['precision']:.4f}  "
+                f"rec={val_metrics['recall']:.4f}  "
+                f"f1={val_metrics['f1']:.4f}  "
+                f"cls_px_acc={val_metrics['class_pixel_acc']:.4f}"
             )
 
-            if val_total < best_val_loss:
-                best_val_loss = val_total
-                best_path = os.path.join(args.output_dir, "best_model.pth")
-                torch.save({"epoch": epoch, "model": model.state_dict()}, best_path)
-                print(f"  → best model saved (val_total={val_total:.4f})")
+            # Best model criterion: highest validation F1
+            score = val_metrics["f1"]
+        else:
+            # No validation set: use negative training loss (lower loss → higher score)
+            score = -train_losses["total"]
 
-    # Save final model
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch
+            best_path = os.path.join(args.output_dir, "best_model.pth")
+            torch.save({"epoch": epoch, "model": model.state_dict()}, best_path)
+            criterion = ("val_f1" if val_loader is not None
+                         else "train_loss(neg)")
+            print(f"  → best_model.pth updated "
+                  f"(epoch={epoch}, {criterion}={score:.4f})")
+
+        # ---------- periodic checkpoint (every save_interval epochs) ----------
+        if epoch % args.save_interval == 0 or epoch == args.epochs:
+            ckpt_path = os.path.join(
+                args.output_dir, f"checkpoint_epoch{epoch:03d}.pth"
+            )
+            torch.save(
+                {
+                    "epoch":        epoch,
+                    "model":        model.state_dict(),
+                    "optimizer":    optimizer.state_dict(),
+                    "scheduler":    scheduler.state_dict(),
+                    "train_losses": train_losses,
+                },
+                ckpt_path,
+            )
+            print(f"  checkpoint saved → {ckpt_path}")
+
+    # ---- final model ----
     final_path = os.path.join(args.output_dir, "final_model.pth")
     torch.save({"epoch": args.epochs, "model": model.state_dict()}, final_path)
     print(f"\nTraining complete. Final model saved to: {final_path}")
+
+    if val_loader is not None:
+        print(
+            f"Best model: epoch {best_epoch}, val_f1={best_score:.4f} → "
+            f"{os.path.join(args.output_dir, 'best_model.pth')}"
+        )
+    else:
+        print(
+            f"Best model: epoch {best_epoch}, train_loss={-best_score:.4f} → "
+            f"{os.path.join(args.output_dir, 'best_model.pth')}"
+        )
+
+    # ---- save metrics history ----
+    history_path = os.path.join(args.output_dir, "metrics_history.json")
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"Metrics history saved to: {history_path}")
+
+    # ---- plot training curves and detection metrics ----
+    print("Generating plots...")
+    plot_training_curves(history, args.output_dir)
 
 
 if __name__ == "__main__":

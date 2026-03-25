@@ -177,18 +177,11 @@ class SongpanHeritageDataset(data.Dataset):
         boxes_xywh = torch.tensor([a["bbox"] for a in anns], dtype=torch.float32)  # (N, 4)
         # convert [x, y, w, h] -> [cx, cy, w, h] normalised
         boxes_cxcywh = torch.zeros_like(boxes_xywh)
-        # boxes_cxcywh[:, 0] = (boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2) / orig_w
-        # boxes_cxcywh[:, 1] = (boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2) / orig_h
-        # boxes_cxcywh[:, 2] = boxes_xywh[:, 2] / orig_w
-        # boxes_cxcywh[:, 3] = boxes_xywh[:, 3] / orig_h
-        # boxes_cxcywh = boxes_cxcywh.clamp(0.0, 1.0)
-        boxes_cxcywh[:, 0] = boxes_cxcywh[:, 0]  # x1
-        boxes_cxcywh[:, 1] = boxes_cxcywh[:, 1]  # y1
-        boxes_cxcywh[:, 2] = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] # x2 = x1 + w
-        boxes_cxcywh[:, 3] = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] # y2 = y1 + h
-        # 限制坐标不超出图片边界
-        boxes_cxcywh[:, 0::2].clamp_(min=0, max=orig_w)
-        boxes_cxcywh[:, 1::2].clamp_(min=0, max=orig_h)
+        boxes_cxcywh[:, 0] = (boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2) / orig_w
+        boxes_cxcywh[:, 1] = (boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2) / orig_h
+        boxes_cxcywh[:, 2] = boxes_xywh[:, 2] / orig_w
+        boxes_cxcywh[:, 3] = boxes_xywh[:, 3] / orig_h
+        boxes_cxcywh = boxes_cxcywh.clamp(0.0, 1.0)
 
         labels = torch.tensor([a["category_id"] for a in anns], dtype=torch.long)
 

@@ -366,6 +366,8 @@ python finetune/train_grounding_dino.py \
 | `--lr` | 学习率 | 1e-5 |
 | `--lr_backbone` | 主干网络学习率 | 1e-6 |
 | `--freeze_backbone` | 冻结主干，仅训练检测头 | False |
+| `--save_interval` | 每隔多少轮保存一次检查点（最终轮总会保存） | 10 |
+| `--iou_threshold` | 计算检测指标时的 IoU 阈值 | 0.5 |
 | `--weight_loss_cls` | 分类损失权重 | 1.0 |
 | `--weight_loss_bbox` | 边框 L1 损失权重 | 5.0 |
 | `--weight_loss_giou` | GIoU 损失权重 | 2.0 |
@@ -377,9 +379,29 @@ python finetune/train_grounding_dino.py \
 3. **数据量较大（> 1000 张）**：可使用 SwinB 版本（`GroundingDINO_SwinB.py`）。
 
 输出文件：
-- `outputs/songpan_finetune/checkpoint_epoch*.pth` — 每轮检查点
-- `outputs/songpan_finetune/best_model.pth` — 验证损失最低的检查点
-- `outputs/songpan_finetune/final_model.pth` — 训练结束后的最终模型
+
+| 文件 | 说明 |
+|------|------|
+| `checkpoint_epoch010.pth` | 周期性检查点（每 `--save_interval` 轮一次） |
+| `best_model.pth` | 验证 F1 最高的模型（无验证集时为训练损失最低的模型） |
+| `final_model.pth` | 最后一轮的权重 |
+| `training_curves.png` | 训练 / 验证损失曲线（matplotlib） |
+| `detection_metrics.png` | Accuracy / Precision / Recall / F1 / Class Pixel Acc 曲线 |
+| `metrics_history.json` | 每轮的所有数值，可供后续分析 |
+
+**性能指标定义 / Detection metrics:**
+
+验证集上，对每张图像用匈牙利匹配将预测框与真值框配对，然后按 IoU 阈值统计：
+
+| 指标 | 定义 |
+|------|------|
+| Accuracy | TP / (TP + FP + FN) — 实例级 Jaccard 系数 |
+| Precision | TP / (TP + FP) |
+| Recall | TP / (TP + FN) |
+| F1-score | 2 × Precision × Recall / (Precision + Recall) |
+| Class Pixel Acc | 各类别 Recall 的均值（每类检测率的平均） |
+
+其中：TP = 配对 IoU ≥ 阈值的对数，FP = 预测总数 − TP，FN = 真值总数 − TP。
 
 ---
 
@@ -491,6 +513,18 @@ A: 减小 `--batch_size 1`，或使用 `--freeze_backbone` 降低显存占用。
 
 **Q: 检测不到目标**  
 A: 降低 `--box_threshold`（如 0.20）和 `--text_threshold`（如 0.15）。
+
+**Q: 想修改检查点保存频率 / How to change checkpoint saving frequency?**  
+A: 使用 `--save_interval N`（默认 10），即每 N 轮保存一次。训练结束的最后一轮总会保存，
+`best_model.pth`（性能最优）也始终自动更新。  
+A: Use `--save_interval N` (default 10). The last epoch is always saved.
+`best_model.pth` is always updated when the model improves.
+
+**Q: best_model.pth 是如何选出的？/ How is the best model selected?**  
+A: 提供 `--val_json` 时，每轮验证后计算 **val F1-score**，保存历轮 F1 最高的模型。
+未提供验证集时，以**训练总损失最低**的轮次作为最优模型。  
+A: When `--val_json` is given, the model with the highest **validation F1-score** across all
+epochs is saved. Without a validation set, the model with the lowest training loss is saved.
 
 **Q: 想添加新类别（如"古井"、"牌坊"）**  
 A: 修改 `finetune/prepare_dataset.py` 和 `finetune/songpan_dataset.py` 中的
