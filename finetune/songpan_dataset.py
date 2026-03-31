@@ -5,7 +5,10 @@ heritage element dataset.
 Each item returned by __getitem__ contains:
     image      : torch.Tensor  (3, H, W) – normalised image
     target     : dict
-        "boxes"          : FloatTensor (N, 4)  – cx/cy/w/h in [0, 1]
+        "boxes"          : FloatTensor (N, 4)  – cx/cy/w/h in [0, 1]  (normalised cxcywh
+                           after GroundingDINO transforms; internally the dataset builds
+                           absolute xyxy pixel coordinates and passes them to T.Normalize,
+                           which converts them to normalised cxcywh.)
         "labels"         : LongTensor  (N,)    – category ids
         "caption"        : str                 – e.g. "temple . ancient city wall ."
         "tokens_positive": list[list[[int,int]]]  – char spans per box
@@ -174,14 +177,24 @@ class SongpanHeritageDataset(data.Dataset):
         orig_w, orig_h = image_pil.size  # PIL returns (width, height)
 
         # ----- build targets in DETR-format -----
+        # GroundingDINO transforms (specifically T.Normalize) expect boxes in
+        # ABSOLUTE XYXY pixel coordinates.  The Normalize step applies
+        # box_xyxy_to_cxcywh(boxes) / [w, h, w, h], converting them to the
+        # normalised cxcywh format that the training loop expects.
+        # Providing normalised cxcywh here would cause T.Normalize to apply the
+        # conversion a second time, producing near-zero/degenerate boxes and
+        # corrupting the training signal (leading to NaN loss_cls after ~100s of steps).
         boxes_xywh = torch.tensor([a["bbox"] for a in anns], dtype=torch.float32)  # (N, 4)
-        # convert [x, y, w, h] -> [cx, cy, w, h] normalised
-        boxes_cxcywh = torch.zeros_like(boxes_xywh)
-        boxes_cxcywh[:, 0] = (boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2) / orig_w
-        boxes_cxcywh[:, 1] = (boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2) / orig_h
-        boxes_cxcywh[:, 2] = boxes_xywh[:, 2] / orig_w
-        boxes_cxcywh[:, 3] = boxes_xywh[:, 3] / orig_h
-        boxes_cxcywh = boxes_cxcywh.clamp(0.0, 1.0)
+        # COCO bbox = [x_min, y_min, width, height]  → xyxy pixel
+        boxes_xyxy = torch.stack([
+            boxes_xywh[:, 0],                        # x1
+            boxes_xywh[:, 1],                        # y1
+            boxes_xywh[:, 0] + boxes_xywh[:, 2],    # x2 = x1 + w
+            boxes_xywh[:, 1] + boxes_xywh[:, 3],    # y2 = y1 + h
+        ], dim=1)
+        # Clamp to image boundaries (guards against annotations that slightly exceed the image)
+        boxes_xyxy[:, 0::2].clamp_(min=0.0, max=float(orig_w))
+        boxes_xyxy[:, 1::2].clamp_(min=0.0, max=float(orig_h))
 
         labels = torch.tensor([a["category_id"] for a in anns], dtype=torch.long)
 
@@ -196,7 +209,7 @@ class SongpanHeritageDataset(data.Dataset):
         ]
 
         target = {
-            "boxes": boxes_cxcywh,             # (N, 4) normalised cxcywh
+            "boxes": boxes_xyxy,               # (N, 4) absolute xyxy pixel – Normalize converts to cxcywh
             "labels": labels,                   # (N,)
             "caption": self.caption,            # shared caption string
             "tokens_positive": tokens_positive, # list of [[start, end], ...]
@@ -206,8 +219,10 @@ class SongpanHeritageDataset(data.Dataset):
         }
 
         # ----- apply image transforms -----
-        # GroundingDINO transforms accept (PIL image, target_dict)
-        # and expect target["boxes"] in cxcywh normalised, which they leave unchanged.
+        # GroundingDINO transforms accept (PIL image, target_dict) and expect
+        # target["boxes"] in ABSOLUTE XYXY pixel coordinates.
+        # After transforms (including T.Normalize), target["boxes"] will be in
+        # normalised cxcywh format, ready for compute_loss / HungarianMatcher.
         image_tensor, target = self.transforms(image_pil, target)
 
         return image_tensor, target

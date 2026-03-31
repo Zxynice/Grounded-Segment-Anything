@@ -85,9 +85,16 @@ def sigmoid_focal_loss(
     alpha: float = 0.25,
     gamma: float = 2.0,
 ) -> torch.Tensor:
-    """Focal loss for text-visual alignment."""
+    """Focal loss for text-visual alignment.
+
+    Includes a numerical guard (nan_to_num) to handle the rare case where the
+    model produces NaN or ±Inf logits during fine-tuning instability.
+    """
     if num_boxes == 0:
         return inputs.sum() * 0.0
+    # Guard against NaN / ±Inf that can propagate from the model's attention
+    # layers when training has temporarily gone unstable.
+    inputs = torch.nan_to_num(inputs, nan=0.0, posinf=50.0, neginf=-50.0)
     prob = inputs.sigmoid()
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
@@ -252,6 +259,14 @@ def compute_loss(
         if ng == 0:
             continue
 
+        # Skip this image if the model produced non-finite logits (NaN/Inf).
+        # This can happen transiently during fine-tuning when attention weights
+        # become extreme; skipping avoids propagating NaN gradients.
+        if not torch.isfinite(pred_logits).all():
+            img_id = target.get("image_id", "?")
+            print(f"  [warn] Non-finite pred_logits for image_id={img_id} (batch index {b_idx}) – skipping.")
+            continue
+
         # Clamp predicted logits to max_text_len
         max_text_len = tgt_positive_map.shape[1]
         pred_logits_clamped = pred_logits[:, :max_text_len]
@@ -380,6 +395,20 @@ def train_one_epoch(
             outputs, targets, matcher, device,
             weight_loss_cls, weight_loss_bbox, weight_loss_giou,
         )
+
+        # Guard: skip the backward/update if the loss is non-finite.  This can
+        # happen when a batch accidentally contained no valid targets (all were
+        # filtered by the NaN guard inside compute_loss) or due to transient
+        # numerical issues in the model.
+        if not torch.isfinite(loss):
+            print(
+                f"  [warn] Non-finite loss ({loss.item()}) at epoch {epoch} "
+                f"batch {batch_idx + 1}/{n_batches} – skipping update."
+            )
+            optimizer.zero_grad()
+            for k, v in loss_dict.items():
+                running[k] += 0.0
+            continue
 
         optimizer.zero_grad()
         loss.backward()
